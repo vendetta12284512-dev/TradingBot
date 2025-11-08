@@ -1,79 +1,138 @@
-import os
-import asyncio
-import time
-import nest_asyncio
+import os, sqlite3, asyncio, nest_asyncio
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.error import NetworkError, BadRequest
+from telegram.error import BadRequest
 
-# Apply nest_asyncio for safety on some platforms
 nest_asyncio.apply()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # must be set in Render Environment -> BOT_TOKEN
-if not BOT_TOKEN:
-    print("ERROR: BOT_TOKEN environment variable is not set. Set it in Render (Environment).")
-    raise SystemExit(1)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_USERNAME = "@TradingBot"
+CHANNEL_INVITE_LINK = "https://t.me/+HKZpb8KyqVdiNDMy"
+ADMIN_IDS = [5257805935]
+DB_PATH = "users.db"
 
-# Simple dark-themed TradingBot with inline menu buttons
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user.first_name or "user"
-    keyboard = [
-        [InlineKeyboardButton("📈 Старт", callback_data="start_work")],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = (
-        f"🌙 <b>TradingBot (Dark)</b>\n\n"
-        f"Привет, <b>{user}</b>!\n\n"
-        "Добро пожаловать. Выбери действие ниже 👇"
-    )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "start_work":
-        await query.edit_message_text("🚀 Бот готов к работе! Напиши /help чтобы узнать команды.")
-    elif query.data == "help":
-        help_text = (
-            "ℹ️ <b>Помощь TradingBot</b>\n\n"
-            "/start — открыть меню\n"
-            "/help — показать это сообщение\n\n"
-            "Этот бот оформлен в тёмной теме. Для развёртывания в облаке используйте Render.com и укажите переменную окружения BOT_TOKEN."
+# ====== База данных ======
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            is_subscribed INTEGER DEFAULT 0,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP
         )
-        await query.edit_message_text(help_text, parse_mode="HTML")
-    else:
-        await query.edit_message_text("⚠️ Неизвестная команда.")
+    """)
+    conn.commit()
+    conn.close()
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "ℹ️ <b>Помощь TradingBot</b>\n\n"
-        "/start — открыть меню\n"
-        "/help — показать это сообщение\n\n"
-        "Кнопки: 📈 Старт, ℹ️ Помощь"
-    )
-    await update.message.reply_text(help_text, parse_mode="HTML")
+def add_or_update_user(user, is_sub=False):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users(user_id, username, first_name, last_name, is_subscribed, last_seen)
+        VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+        username=excluded.username, first_name=excluded.first_name,
+        last_name=excluded.last_name, is_subscribed=excluded.is_subscribed,
+        last_seen=CURRENT_TIMESTAMP
+    """, (user.id, user.username, user.first_name, user.last_name, int(is_sub)))
+    conn.commit()
+    conn.close()
 
-async def main():
-    # main loop with resilient reconnects
-    while True:
-        try:
-            app = ApplicationBuilder().token(BOT_TOKEN).build()
-            app.add_handler(CommandHandler("start", start_command))
-            app.add_handler(CommandHandler("help", help_command))
-            app.add_handler(CallbackQueryHandler(button_handler))
-            print("🌙 TradingBot (Dark) starting... (using BOT_TOKEN from env)")
-            # run_polling is an async method that will block until stopped
-            await app.run_polling()
-        except (NetworkError, BadRequest) as e:
-            print(f"⚠️ Network/Telegram error: {e}. Reconnecting in 10 seconds...")
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"⚠️ Unexpected error: {e}. Reconnecting in 10 seconds...")
-            await asyncio.sleep(10)
-
-if __name__ == '__main__':
+async def is_subscribed(bot, user_id):
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Shutting down TradingBot.")
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except BadRequest:
+        return False
+
+def user_is_admin(uid): return uid in ADMIN_IDS
+
+# ====== Хендлеры ======
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    sub = await is_subscribed(ctx.bot, user.id)
+    add_or_update_user(user, sub)
+    if sub:
+        await update.message.reply_text(f"🌙 Привет, {user.first_name}! Доступ открыт.")
+    else:
+        kb = [[InlineKeyboardButton("📈 Подписаться", url=CHANNEL_INVITE_LINK)],
+              [InlineKeyboardButton("Проверить подписку", callback_data="check_sub")]]
+        await update.message.reply_text("Подпишись на канал, чтобы пользоваться ботом:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    if await is_subscribed(ctx.bot, user.id):
+        add_or_update_user(user, True)
+        await q.edit_message_text("✅ Подписка подтверждена, можешь пользоваться ботом.")
+    else:
+        kb = [[InlineKeyboardButton("📈 Подписаться", url=CHANNEL_INVITE_LINK)],
+              [InlineKeyboardButton("Проверить снова", callback_data="check_sub")]]
+        await q.edit_message_text("❌ Подписка не найдена. Попробуй снова:", reply_markup=InlineKeyboardMarkup(kb))
+
+# ====== Статистика ======
+def get_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE is_subscribed=1")
+    subs = cur.fetchone()[0]
+    since = datetime.utcnow() - timedelta(days=1)
+    cur.execute("SELECT COUNT(*) FROM users WHERE first_seen>=?", (since,))
+    new_24h = cur.fetchone()[0]
+    conn.close()
+    return {"total": total, "subscribed": subs, "new_24h": new_24h}
+
+async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not user_is_admin(u.id):
+        return await update.message.reply_text("🚫 Нет доступа")
+    kb = [[InlineKeyboardButton("📊 Статистика", callback_data="adm_stats")],
+          [InlineKeyboardButton("📥 Экспорт CSV", callback_data="adm_export")]]
+    await update.message.reply_text("Панель администратора:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def adm_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = q.from_user
+    if not user_is_admin(u.id):
+        return await q.edit_message_text("🚫 Нет доступа")
+    if q.data == "adm_stats":
+        st = get_stats()
+        await q.edit_message_text(f"📊 Пользователей: {st['total']}\nПодписаны: {st['subscribed']}\nНовых за 24ч: {st['new_24h']}")
+    elif q.data == "adm_export":
+        import tempfile, csv
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users")
+        rows = cur.fetchall()
+        conn.close()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        writer = csv.writer(tmp)
+        writer.writerow(["id","uid","username","first","last","sub","first_seen","last_seen"])
+        writer.writerows(rows)
+        tmp.close()
+        await ctx.bot.send_document(chat_id=u.id, document=tmp.name, filename="users.csv")
+
+# ====== Основной запуск ======
+async def main():
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(check, pattern="check_sub"))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CallbackQueryHandler(adm_cb, pattern="adm_"))
+    await app.run_polling()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
